@@ -1,519 +1,457 @@
 from __future__ import annotations
 
-import io
+import json
+import os
 import re
+from typing import Any
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable
+from crewai import Agent, Crew, LLM, Process, Task
 
-import numpy as np
-
-from docx import Document as DocxDocument
-from pypdf import PdfReader
-
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from rag import SearchHit
 
 
-SUPPORTED_EXTENSIONS = {
-    ".pdf",
-    ".docx",
-}
+def get_secret(name: str, default: str = "") -> str:
+    """Read a secret from environment variables or Streamlit secrets."""
+
+    value = os.environ.get(name)
+
+    if value:
+        return value
+
+    try:
+        import streamlit as st
+
+        value = st.secrets.get(name)
+
+        if value:
+            return str(value)
+
+    except Exception:
+        pass
+
+    return default
 
 
-WORDS_PER_CHUNK = 220
+def create_llm() -> LLM:
+    """Create the configured LLM."""
 
-OVERLAP_WORDS = 35
+    provider = get_secret(
+        "LLM_PROVIDER",
+        "groq",
+    ).lower()
 
+    if provider == "gemini":
 
-# =========================================================
-# Data classes
-# =========================================================
+        api_key = get_secret("GEMINI_API_KEY")
 
-@dataclass(frozen=True)
-class DocumentChunk:
-
-    text: str
-
-    source_name: str
-
-    page: int | None
-
-    chunk_number: int
-
-
-    @property
-    def source_label(self) -> str:
-
-        if self.page is not None:
-
-            return (
-                f"{self.source_name} — "
-                f"Page {self.page}"
+        if not api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is missing from Streamlit Secrets."
             )
 
-        return (
-            f"{self.source_name} — "
-            f"Document text"
+        return LLM(
+            model=get_secret(
+                "GEMINI_MODEL",
+                "gemini/gemini-2.5-flash",
+            ),
+            api_key=api_key,
+            temperature=0.1,
+            max_tokens=1200,
         )
 
+    # Default: Groq
 
-@dataclass(frozen=True)
-class SearchHit:
+    api_key = get_secret("GROQ_API_KEY")
 
-    text: str
-
-    source_name: str
-
-    page: int | None
-
-    chunk_number: int
-
-    score: float
-
-
-    @property
-    def source_label(self) -> str:
-
-        if self.page is not None:
-
-            return (
-                f"{self.source_name} — "
-                f"Page {self.page}"
-            )
-
-        return (
-            f"{self.source_name} — "
-            f"Document text"
+    if not api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY is missing from Streamlit Secrets."
         )
 
-
-# =========================================================
-# Document index
-# =========================================================
-
-class DocumentIndex:
-
-    def __init__(
-        self,
-        chunks: list[DocumentChunk],
-    ):
-
-        if not chunks:
-
-            raise ValueError(
-                "No readable text was found "
-                "in the uploaded files."
-            )
-
-
-        self.chunks = chunks
-
-
-        self.vectorizer = TfidfVectorizer(
-
-            lowercase=True,
-
-            strip_accents="unicode",
-
-            ngram_range=(1, 2),
-
-            sublinear_tf=True,
-
-            min_df=1,
-
-            max_features=50000,
-        )
-
-
-        self.matrix = (
-            self.vectorizer.fit_transform(
-                [chunk.text for chunk in chunks]
-            )
-        )
-
-
-    # =====================================================
-    # Create index from Streamlit uploads
-    # =====================================================
-
-    @classmethod
-    def from_uploaded_files(
-        cls,
-        uploaded_files: Iterable,
-    ) -> "DocumentIndex":
-
-        chunks = []
-
-
-        for uploaded in uploaded_files:
-
-            name = uploaded.name
-
-            suffix = Path(name).suffix.lower()
-
-            raw = uploaded.getvalue()
-
-
-            # ---------------------------------------------
-            # PDF
-            # ---------------------------------------------
-
-            if suffix == ".pdf":
-
-                pages = _extract_pdf_pages(raw)
-
-
-                for page_number, text in pages:
-
-                    new_chunks = _chunk_text(
-
-                        text,
-
-                        name,
-
-                        page_number,
-
-                        len(chunks) + 1,
-                    )
-
-                    chunks.extend(new_chunks)
-
-
-            # ---------------------------------------------
-            # DOCX
-            # ---------------------------------------------
-
-            elif suffix == ".docx":
-
-                text = _extract_docx(raw)
-
-
-                new_chunks = _chunk_text(
-
-                    text,
-
-                    name,
-
-                    None,
-
-                    len(chunks) + 1,
-                )
-
-                chunks.extend(new_chunks)
-
-
-        return cls(chunks)
-
-
-    # =====================================================
-    # Document information
-    # =====================================================
-
-    @property
-    def document_names(self) -> list[str]:
-
-        return list(
-            dict.fromkeys(
-                chunk.source_name
-                for chunk in self.chunks
-            )
-        )
-
-
-    @property
-    def document_count(self) -> int:
-
-        return len(
-            self.document_names
-        )
-
-
-    @property
-    def chunk_count(self) -> int:
-
-        return len(self.chunks)
-
-
-    # =====================================================
-    # Search
-    # =====================================================
-
-    def search(
-        self,
-        query: str,
-        top_k: int = 5,
-    ) -> list[SearchHit]:
-
-        query = query.strip()
-
-
-        if not query:
-
-            return []
-
-
-        query_vector = (
-            self.vectorizer.transform(
-                [query]
-            )
-        )
-
-
-        scores = cosine_similarity(
-            query_vector,
-            self.matrix,
-        ).ravel()
-
-
-        ranked_indices = np.argsort(
-            scores
-        )[::-1]
-
-
-        hits = []
-
-
-        for index in ranked_indices:
-
-            score = float(
-                scores[index]
-            )
-
-
-            if score <= 0:
-
-                continue
-
-
-            chunk = self.chunks[
-                int(index)
-            ]
-
-
-            hits.append(
-                SearchHit(
-
-                    text=chunk.text,
-
-                    source_name=chunk.source_name,
-
-                    page=chunk.page,
-
-                    chunk_number=chunk.chunk_number,
-
-                    score=score,
-                )
-            )
-
-
-            if len(hits) >= top_k:
-
-                break
-
-
-        return hits
-
-
-# =========================================================
-# PDF extraction
-# =========================================================
-
-def _extract_pdf_pages(
-    raw: bytes,
-) -> list[tuple[int, str]]:
-
-    reader = PdfReader(
-        io.BytesIO(raw)
+    return LLM(
+        model=get_secret(
+            "GROQ_MODEL",
+            "groq/openai/gpt-oss-120b",
+        ),
+        api_key=api_key,
+        base_url="https://api.groq.com/openai/v1",
+        temperature=0.1,
+        max_tokens=1200,
     )
 
 
-    pages = []
+def format_evidence(hits: list[SearchHit]) -> str:
+    """Convert retrieved passages into a prompt-friendly format."""
 
+    sections = []
 
-    for page_number, page in enumerate(
-        reader.pages,
-        start=1,
-    ):
+    for number, hit in enumerate(hits, start=1):
 
-        text = _clean_text(
-            page.extract_text() or ""
+        if hit.page is not None:
+            location = f"Page {hit.page}"
+        else:
+            location = "Document text"
+
+        sections.append(
+            f"""
+[EVIDENCE {number}]
+
+Source: {hit.source_name}
+Location: {location}
+Similarity: {hit.score:.3f}
+
+Text:
+{hit.text}
+""".strip()
         )
 
-
-        if text:
-
-            pages.append(
-                (
-                    page_number,
-                    text,
-                )
-            )
+    return "\n\n".join(sections)
 
 
-    return pages
+def extract_json(text: str) -> dict[str, Any]:
+    """Safely extract a JSON object from an LLM response."""
 
+    text = text.strip()
 
-# =========================================================
-# DOCX extraction
-# =========================================================
+    # Remove ```json ... ``` if the model adds Markdown fences.
 
-def _extract_docx(
-    raw: bytes,
-) -> str:
+    if text.startswith("```"):
 
-    document = DocxDocument(
-        io.BytesIO(raw)
-    )
-
-
-    parts = []
-
-
-    # Normal paragraphs
-
-    for paragraph in document.paragraphs:
-
-        text = paragraph.text.strip()
-
-
-        if text:
-
-            parts.append(text)
-
-
-    # Tables
-
-    for table in document.tables:
-
-        for row in table.rows:
-
-            cells = [
-                cell.text.strip()
-                for cell in row.cells
-            ]
-
-
-            row_text = " | ".join(
-                cell
-                for cell in cells
-                if cell
-            )
-
-
-            if row_text:
-
-                parts.append(
-                    row_text
-                )
-
-
-    return _clean_text(
-        "\n".join(parts)
-    )
-
-
-# =========================================================
-# Chunking
-# =========================================================
-
-def _chunk_text(
-    text: str,
-    source_name: str,
-    page: int | None,
-    start_chunk: int,
-) -> list[DocumentChunk]:
-
-    text = _clean_text(text)
-
-
-    words = text.split()
-
-
-    if not words:
-
-        return []
-
-
-    chunks = []
-
-
-    start = 0
-
-    number = start_chunk
-
-
-    while start < len(words):
-
-        end = min(
-            len(words),
-            start + WORDS_PER_CHUNK,
+        text = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
         )
 
-
-        chunk_text = " ".join(
-            words[start:end]
+        text = re.sub(
+            r"\s*```$",
+            "",
+            text,
         )
 
+    # First attempt: entire response is JSON.
 
-        chunks.append(
-            DocumentChunk(
+    try:
 
-                text=chunk_text,
+        result = json.loads(text)
 
-                source_name=source_name,
+        if isinstance(result, dict):
+            return result
 
-                page=page,
+    except json.JSONDecodeError:
+        pass
 
-                chunk_number=number,
-            )
-        )
+    # Second attempt: locate a JSON object inside the response.
 
-
-        number += 1
-
-
-        if end >= len(words):
-
-            break
-
-
-        start = max(
-            start + 1,
-            end - OVERLAP_WORDS,
-        )
-
-
-    return chunks
-
-
-# =========================================================
-# Text cleaning
-# =========================================================
-
-def _clean_text(
-    text: str,
-) -> str:
-
-    text = text.replace(
-        "\x00",
-        " ",
-    )
-
-
-    text = re.sub(
-        r"[ \t]+",
-        " ",
+    match = re.search(
+        r"\{.*\}",
         text,
+        flags=re.DOTALL,
     )
 
+    if match:
 
-    text = re.sub(
-        r"\n{3,}",
-        "\n\n",
-        text,
+        try:
+
+            result = json.loads(
+                match.group(0)
+            )
+
+            if isinstance(result, dict):
+                return result
+
+        except json.JSONDecodeError:
+            pass
+
+    return {}
+
+
+# ============================================================
+# THIS IS THE FUNCTION APP.PY IMPORTS
+# ============================================================
+
+def run_study_crew(
+    question: str,
+    hits: list[SearchHit],
+) -> dict[str, Any]:
+
+    # --------------------------------------------------------
+    # No evidence
+    # --------------------------------------------------------
+
+    if not hits:
+
+        return {
+            "answer": (
+                "NOT FOUND IN DOCUMENT: "
+                "No relevant evidence was retrieved."
+            ),
+            "not_found": True,
+            "citations": [],
+            "retriever_summary": (
+                "The retrieval system did not find "
+                "relevant passages."
+            ),
+        }
+
+    # --------------------------------------------------------
+    # Create LLM
+    # --------------------------------------------------------
+
+    llm = create_llm()
+
+    evidence = format_evidence(hits)
+
+    # --------------------------------------------------------
+    # AGENT 1
+    # --------------------------------------------------------
+
+    document_retriever = Agent(
+
+        role="Document Retriever",
+
+        goal=(
+            "Analyze the supplied textbook evidence and identify "
+            "the passages and facts that directly answer the "
+            "student's question."
+        ),
+
+        backstory=(
+            "You are a careful academic research assistant. "
+            "You must work ONLY with the document evidence "
+            "provided to you. Never invent information."
+        ),
+
+        llm=llm,
+
+        allow_delegation=False,
+
+        verbose=False,
     )
 
+    # --------------------------------------------------------
+    # AGENT 2
+    # --------------------------------------------------------
 
-    return text.strip()
+    ai_tutor = Agent(
+
+        role="AI Tutor",
+
+        goal=(
+            "Explain the answer to the student clearly using "
+            "only the evidence provided by the Document Retriever."
+        ),
+
+        backstory=(
+            "You are a patient textbook tutor. Your job is to "
+            "turn verified textbook evidence into an easy-to-"
+            "understand explanation."
+        ),
+
+        llm=llm,
+
+        allow_delegation=False,
+
+        verbose=False,
+    )
+
+    # --------------------------------------------------------
+    # AGENT 1 TASK
+    # --------------------------------------------------------
+
+    retrieval_task = Task(
+
+        description=f"""
+Student question:
+
+{question}
+
+
+Retrieved textbook evidence:
+
+{evidence}
+
+
+Your job:
+
+1. Identify which passages are relevant.
+2. Extract the facts needed to answer the question.
+3. Identify the source and page where possible.
+4. Do not use outside knowledge.
+5. If the evidence is insufficient, say so.
+""",
+
+        expected_output=(
+            "A concise evidence summary containing only "
+            "facts supported by the supplied document passages."
+        ),
+
+        agent=document_retriever,
+    )
+
+    # --------------------------------------------------------
+    # AGENT 2 TASK
+    # --------------------------------------------------------
+
+    tutor_task = Task(
+
+        description=f"""
+Student question:
+
+{question}
+
+
+Use the Document Retriever's evidence summary to answer
+the student's question.
+
+IMPORTANT RULES:
+
+- Use only information supported by the retrieved document.
+- Do not invent facts.
+- Do not add unrelated outside knowledge.
+- Explain the concept at a student-friendly level.
+- If the evidence does not contain enough information,
+  set "not_found" to true.
+- Include source/page references when available.
+
+
+Return ONLY valid JSON using this structure:
+
+{{
+    "answer": "Your student-friendly answer",
+    "not_found": false,
+    "citations": [
+        "filename.pdf — Page 4"
+    ]
+}}
+""",
+
+        expected_output=(
+            "Valid JSON containing answer, not_found, "
+            "and citations."
+        ),
+
+        agent=ai_tutor,
+
+        context=[retrieval_task],
+    )
+
+    # --------------------------------------------------------
+    # CREW
+    # --------------------------------------------------------
+
+    crew = Crew(
+
+        agents=[
+            document_retriever,
+            ai_tutor,
+        ],
+
+        tasks=[
+            retrieval_task,
+            tutor_task,
+        ],
+
+        process=Process.sequential,
+
+        verbose=False,
+    )
+
+    # --------------------------------------------------------
+    # Run
+    # --------------------------------------------------------
+
+    result = crew.kickoff()
+
+    raw_response = getattr(
+        result,
+        "raw",
+        str(result),
+    )
+
+    parsed = extract_json(
+        raw_response
+    )
+
+    # --------------------------------------------------------
+    # Answer
+    # --------------------------------------------------------
+
+    answer = str(
+        parsed.get(
+            "answer",
+            "",
+        )
+    ).strip()
+
+    if not answer:
+        answer = raw_response.strip()
+
+    if not answer:
+        answer = "The AI tutor did not return an answer."
+
+    # --------------------------------------------------------
+    # Not found
+    # --------------------------------------------------------
+
+    not_found = bool(
+        parsed.get(
+            "not_found",
+            False,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Citations
+    # --------------------------------------------------------
+
+    citations = parsed.get(
+        "citations",
+        [],
+    )
+
+    if not isinstance(
+        citations,
+        list,
+    ):
+        citations = []
+
+    # If the model didn't provide citations,
+    # generate them from retrieved evidence.
+
+    if not citations:
+
+        citations = sorted(
+            {
+                hit.source_label
+                for hit in hits
+            }
+        )
+
+    # --------------------------------------------------------
+    # Agent 1 output
+    # --------------------------------------------------------
+
+    try:
+
+        retriever_summary = (
+            retrieval_task.output.raw
+        )
+
+    except Exception:
+
+        retriever_summary = str(
+            retrieval_task.output
+        )
+
+    # --------------------------------------------------------
+    # Return result to app.py
+    # --------------------------------------------------------
+
+    return {
+        "answer": answer,
+        "not_found": not_found,
+        "citations": citations,
+        "retriever_summary": retriever_summary,
+    }
