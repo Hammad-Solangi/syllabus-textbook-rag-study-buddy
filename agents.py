@@ -5,6 +5,19 @@ import os
 import re
 from typing import Any
 
+# ------------------------------------------------------------------
+# CrewAI + Groq compatibility patch
+#
+# CrewAI can add a "cache_breakpoint" field to messages.
+# Groq's API rejects that field.
+# Disable CrewAI's breakpoint marker for this Groq application.
+# ------------------------------------------------------------------
+
+import crewai.llms.cache as _crewai_cache
+
+_crewai_cache.mark_cache_breakpoint = lambda message: message
+
+# Now import CrewAI components.
 from crewai import Agent, Crew, LLM, Process, Task
 
 from rag import SearchHit
