@@ -471,7 +471,7 @@ Your job:
     # TASK 2 — TEACH THE STUDENT
     # ========================================================
 
-    tutor_task = Task(
+       tutor_task = Task(
 
         description=f"""
 Student question:
@@ -484,21 +484,39 @@ the student's question.
 
 IMPORTANT RULES:
 
-- Use only information supported by the retrieved document.
+1. Use the retrieved document evidence as the primary
+   source of truth.
 
-- Do not invent facts.
+2. Do NOT invent facts that contradict the document.
 
-- Do not add unrelated outside knowledge.
+3. If the document directly answers the question,
+   provide a clear student-friendly answer.
 
-- Explain the concept at a student-friendly level.
+4. If the document provides PARTIAL information about
+   the question, answer using ONLY the supported
+   information and clearly state what the document does
+   and does not explain.
 
-- For mathematics, show the relevant steps clearly when
-  the retrieved evidence contains enough information.
+5. If the document mentions the requested concept but
+   does not provide a complete definition, do NOT mark
+   it as NOT FOUND. Instead, explain the information that
+   IS present in the document.
 
-- If the evidence does not contain enough information,
-  set "not_found" to true.
+6. Only set "not_found" to true when the retrieved
+   evidence contains no meaningful information relevant
+   to the question.
 
-- Include source/page references when available.
+7. For mathematics, show the relevant solution steps when
+   those steps are supported by the supplied material.
+
+8. Include source/page references when available.
+
+9. Do not pretend that information exists in the document
+   when it does not.
+
+Student-friendly explanations are encouraged, but any
+information presented as coming from the textbook must be
+supported by the retrieved evidence.
 
 
 Return ONLY valid JSON using exactly this structure:
@@ -523,7 +541,6 @@ Return ONLY valid JSON using exactly this structure:
             retrieval_task
         ],
     )
-
     # ========================================================
     # CREATE CREW
     # ========================================================
