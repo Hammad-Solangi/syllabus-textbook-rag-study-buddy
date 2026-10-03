@@ -9,6 +9,23 @@ from crewai import Agent, Crew, LLM, Process, Task
 
 from rag import SearchHit
 
+# ------------------------------------------------------------------
+# Groq compatibility fix:
+# CrewAI may add "cache_breakpoint" to messages, but Groq's
+# OpenAI-compatible API does not accept that message property.
+# ------------------------------------------------------------------
+
+import crewai.llms.cache as _crewai_cache
+
+_original_mark_cache_breakpoint = _crewai_cache.mark_cache_breakpoint
+
+
+def _disable_groq_cache_breakpoint(message):
+    return message
+
+
+_crewai_cache.mark_cache_breakpoint = _disable_groq_cache_breakpoint
+
 
 def get_secret(name: str, default: str = "") -> str:
     """Read a secret from environment variables or Streamlit secrets."""
