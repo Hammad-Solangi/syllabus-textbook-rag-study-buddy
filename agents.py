@@ -5,43 +5,79 @@ import os
 import re
 from typing import Any
 
-# ------------------------------------------------------------------
-# CrewAI + Groq compatibility patch
-#
-# CrewAI can add a "cache_breakpoint" field to messages.
-# Groq's API rejects that field.
-# Disable CrewAI's breakpoint marker for this Groq application.
-# ------------------------------------------------------------------
-
-import crewai.llms.cache as _crewai_cache
-
-_crewai_cache.mark_cache_breakpoint = lambda message: message
-
-# Now import CrewAI components.
 from crewai import Agent, Crew, LLM, Process, Task
-
 from rag import SearchHit
 
-# ------------------------------------------------------------------
-# Groq compatibility fix:
-# CrewAI may add "cache_breakpoint" to messages, but Groq's
-# OpenAI-compatible API does not accept that message property.
-# ------------------------------------------------------------------
+# ============================================================
+# GROQ + CREWAI / LITELLM COMPATIBILITY PATCH
+# ============================================================
+#
+# CrewAI may add "cache_breakpoint" to message dictionaries.
+# Groq rejects this property in its OpenAI-compatible API.
+#
+# We remove the property immediately before LiteLLM sends
+# the request to the provider.
+# ============================================================
 
-import crewai.llms.cache as _crewai_cache
-
-_original_mark_cache_breakpoint = _crewai_cache.mark_cache_breakpoint
-
-
-def _disable_groq_cache_breakpoint(message):
-    return message
-
-
-_crewai_cache.mark_cache_breakpoint = _disable_groq_cache_breakpoint
+import litellm
 
 
-def get_secret(name: str, default: str = "") -> str:
-    """Read a secret from environment variables or Streamlit secrets."""
+_original_litellm_completion = litellm.completion
+
+
+def _groq_safe_completion(*args, **kwargs):
+    """
+    Remove CrewAI's unsupported cache_breakpoint field
+    before sending messages through LiteLLM.
+    """
+
+    messages = kwargs.get("messages")
+
+    if isinstance(messages, list):
+
+        cleaned_messages = []
+
+        for message in messages:
+
+            if isinstance(message, dict):
+
+                message = dict(message)
+
+                message.pop(
+                    "cache_breakpoint",
+                    None,
+                )
+
+            cleaned_messages.append(message)
+
+        kwargs["messages"] = cleaned_messages
+
+    return _original_litellm_completion(
+        *args,
+        **kwargs,
+    )
+
+
+litellm.completion = _groq_safe_completion
+
+
+# ============================================================
+# SECRET MANAGEMENT
+# ============================================================
+
+
+def get_secret(
+    name: str,
+    default: str = "",
+) -> str:
+    """
+    Read a configuration value from:
+
+    1. Environment variables
+    2. Streamlit Secrets
+
+    Environment variables take priority.
+    """
 
     value = os.environ.get(name)
 
@@ -49,6 +85,7 @@ def get_secret(name: str, default: str = "") -> str:
         return value
 
     try:
+
         import streamlit as st
 
         value = st.secrets.get(name)
@@ -62,21 +99,41 @@ def get_secret(name: str, default: str = "") -> str:
     return default
 
 
+# ============================================================
+# LLM CREATION
+# ============================================================
+
+
 def create_llm() -> LLM:
-    """Create the configured LLM."""
+    """
+    Create the LLM configured in Streamlit Secrets.
+
+    Supported providers:
+
+    - Groq
+    - Gemini
+    """
 
     provider = get_secret(
         "LLM_PROVIDER",
         "groq",
     ).lower()
 
+    # --------------------------------------------------------
+    # GEMINI
+    # --------------------------------------------------------
+
     if provider == "gemini":
 
-        api_key = get_secret("GEMINI_API_KEY")
+        api_key = get_secret(
+            "GEMINI_API_KEY"
+        )
 
         if not api_key:
+
             raise RuntimeError(
-                "GEMINI_API_KEY is missing from Streamlit Secrets."
+                "GEMINI_API_KEY is missing "
+                "from Streamlit Secrets."
             )
 
         return LLM(
@@ -89,13 +146,19 @@ def create_llm() -> LLM:
             max_tokens=1200,
         )
 
-    # Default: Groq
+    # --------------------------------------------------------
+    # GROQ
+    # --------------------------------------------------------
 
-    api_key = get_secret("GROQ_API_KEY")
+    api_key = get_secret(
+        "GROQ_API_KEY"
+    )
 
     if not api_key:
+
         raise RuntimeError(
-            "GROQ_API_KEY is missing from Streamlit Secrets."
+            "GROQ_API_KEY is missing "
+            "from Streamlit Secrets."
         )
 
     return LLM(
@@ -110,16 +173,34 @@ def create_llm() -> LLM:
     )
 
 
-def format_evidence(hits: list[SearchHit]) -> str:
-    """Convert retrieved passages into a prompt-friendly format."""
+# ============================================================
+# FORMAT RETRIEVED EVIDENCE
+# ============================================================
+
+
+def format_evidence(
+    hits: list[SearchHit],
+) -> str:
+    """
+    Convert retrieved document chunks into a structured
+    prompt for the CrewAI agents.
+    """
 
     sections = []
 
-    for number, hit in enumerate(hits, start=1):
+    for number, hit in enumerate(
+        hits,
+        start=1,
+    ):
 
         if hit.page is not None:
-            location = f"Page {hit.page}"
+
+            location = (
+                f"Page {hit.page}"
+            )
+
         else:
+
             location = "Document text"
 
         sections.append(
@@ -127,7 +208,9 @@ def format_evidence(hits: list[SearchHit]) -> str:
 [EVIDENCE {number}]
 
 Source: {hit.source_name}
+
 Location: {location}
+
 Similarity: {hit.score:.3f}
 
 Text:
@@ -135,15 +218,34 @@ Text:
 """.strip()
         )
 
-    return "\n\n".join(sections)
+    return "\n\n".join(
+        sections
+    )
 
 
-def extract_json(text: str) -> dict[str, Any]:
-    """Safely extract a JSON object from an LLM response."""
+# ============================================================
+# JSON EXTRACTION
+# ============================================================
+
+
+def extract_json(
+    text: str,
+) -> dict[str, Any]:
+    """
+    Safely extract a JSON object from the AI tutor response.
+
+    Handles:
+
+    - Normal JSON
+    - ```json fenced JSON
+    - JSON embedded inside explanatory text
+    """
 
     text = text.strip()
 
-    # Remove ```json ... ``` if the model adds Markdown fences.
+    # --------------------------------------------------------
+    # Remove Markdown code fences
+    # --------------------------------------------------------
 
     if text.startswith("```"):
 
@@ -160,19 +262,30 @@ def extract_json(text: str) -> dict[str, Any]:
             text,
         )
 
-    # First attempt: entire response is JSON.
+    # --------------------------------------------------------
+    # Attempt 1: Entire response is JSON
+    # --------------------------------------------------------
 
     try:
 
-        result = json.loads(text)
+        result = json.loads(
+            text
+        )
 
-        if isinstance(result, dict):
+        if isinstance(
+            result,
+            dict,
+        ):
+
             return result
 
     except json.JSONDecodeError:
+
         pass
 
-    # Second attempt: locate a JSON object inside the response.
+    # --------------------------------------------------------
+    # Attempt 2: Find JSON object inside response
+    # --------------------------------------------------------
 
     match = re.search(
         r"\{.*\}",
@@ -188,27 +301,42 @@ def extract_json(text: str) -> dict[str, Any]:
                 match.group(0)
             )
 
-            if isinstance(result, dict):
+            if isinstance(
+                result,
+                dict,
+            ):
+
                 return result
 
         except json.JSONDecodeError:
+
             pass
 
     return {}
 
 
 # ============================================================
-# THIS IS THE FUNCTION APP.PY IMPORTS
+# MAIN CREWAI WORKFLOW
 # ============================================================
+
 
 def run_study_crew(
     question: str,
     hits: list[SearchHit],
 ) -> dict[str, Any]:
+    """
+    Run the two-agent Study Buddy workflow.
 
-    # --------------------------------------------------------
-    # No evidence
-    # --------------------------------------------------------
+    Agent 1:
+        Document Retriever
+
+    Agent 2:
+        AI Tutor
+    """
+
+    # ========================================================
+    # NO RETRIEVED EVIDENCE
+    # ========================================================
 
     if not hits:
 
@@ -217,34 +345,43 @@ def run_study_crew(
                 "NOT FOUND IN DOCUMENT: "
                 "No relevant evidence was retrieved."
             ),
+
             "not_found": True,
+
             "citations": [],
+
             "retriever_summary": (
                 "The retrieval system did not find "
                 "relevant passages."
             ),
         }
 
-    # --------------------------------------------------------
-    # Create LLM
-    # --------------------------------------------------------
+    # ========================================================
+    # CREATE LLM
+    # ========================================================
 
     llm = create_llm()
 
-    evidence = format_evidence(hits)
+    # ========================================================
+    # FORMAT DOCUMENT EVIDENCE
+    # ========================================================
 
-    # --------------------------------------------------------
-    # AGENT 1
-    # --------------------------------------------------------
+    evidence = format_evidence(
+        hits
+    )
+
+    # ========================================================
+    # AGENT 1 — DOCUMENT RETRIEVER
+    # ========================================================
 
     document_retriever = Agent(
 
         role="Document Retriever",
 
         goal=(
-            "Analyze the supplied textbook evidence and identify "
-            "the passages and facts that directly answer the "
-            "student's question."
+            "Analyze the supplied textbook evidence "
+            "and identify the passages and facts that "
+            "directly answer the student's question."
         ),
 
         backstory=(
@@ -260,23 +397,25 @@ def run_study_crew(
         verbose=False,
     )
 
-    # --------------------------------------------------------
-    # AGENT 2
-    # --------------------------------------------------------
+    # ========================================================
+    # AGENT 2 — AI TUTOR
+    # ========================================================
 
     ai_tutor = Agent(
 
         role="AI Tutor",
 
         goal=(
-            "Explain the answer to the student clearly using "
-            "only the evidence provided by the Document Retriever."
+            "Explain the answer to the student clearly "
+            "using only the evidence provided by the "
+            "Document Retriever."
         ),
 
         backstory=(
-            "You are a patient textbook tutor. Your job is to "
-            "turn verified textbook evidence into an easy-to-"
-            "understand explanation."
+            "You are a patient textbook tutor. "
+            "Your job is to turn verified textbook "
+            "evidence into an easy-to-understand "
+            "explanation."
         ),
 
         llm=llm,
@@ -286,9 +425,9 @@ def run_study_crew(
         verbose=False,
     )
 
-    # --------------------------------------------------------
-    # AGENT 1 TASK
-    # --------------------------------------------------------
+    # ========================================================
+    # TASK 1 — RETRIEVE / VERIFY EVIDENCE
+    # ========================================================
 
     retrieval_task = Task(
 
@@ -306,23 +445,31 @@ Retrieved textbook evidence:
 Your job:
 
 1. Identify which passages are relevant.
+
 2. Extract the facts needed to answer the question.
+
 3. Identify the source and page where possible.
+
 4. Do not use outside knowledge.
-5. If the evidence is insufficient, say so.
+
+5. If the evidence is insufficient, clearly say so.
+
+6. Do not invent or reconstruct information that is
+   not supported by the supplied evidence.
 """,
 
         expected_output=(
             "A concise evidence summary containing only "
-            "facts supported by the supplied document passages."
+            "facts supported by the supplied document "
+            "passages."
         ),
 
         agent=document_retriever,
     )
 
-    # --------------------------------------------------------
-    # AGENT 2 TASK
-    # --------------------------------------------------------
+    # ========================================================
+    # TASK 2 — TEACH THE STUDENT
+    # ========================================================
 
     tutor_task = Task(
 
@@ -338,15 +485,23 @@ the student's question.
 IMPORTANT RULES:
 
 - Use only information supported by the retrieved document.
+
 - Do not invent facts.
+
 - Do not add unrelated outside knowledge.
+
 - Explain the concept at a student-friendly level.
+
+- For mathematics, show the relevant steps clearly when
+  the retrieved evidence contains enough information.
+
 - If the evidence does not contain enough information,
   set "not_found" to true.
+
 - Include source/page references when available.
 
 
-Return ONLY valid JSON using this structure:
+Return ONLY valid JSON using exactly this structure:
 
 {{
     "answer": "Your student-friendly answer",
@@ -358,18 +513,20 @@ Return ONLY valid JSON using this structure:
 """,
 
         expected_output=(
-            "Valid JSON containing answer, not_found, "
-            "and citations."
+            "Valid JSON containing answer, "
+            "not_found, and citations."
         ),
 
         agent=ai_tutor,
 
-        context=[retrieval_task],
+        context=[
+            retrieval_task
+        ],
     )
 
-    # --------------------------------------------------------
-    # CREW
-    # --------------------------------------------------------
+    # ========================================================
+    # CREATE CREW
+    # ========================================================
 
     crew = Crew(
 
@@ -388,11 +545,15 @@ Return ONLY valid JSON using this structure:
         verbose=False,
     )
 
-    # --------------------------------------------------------
-    # Run
-    # --------------------------------------------------------
+    # ========================================================
+    # RUN CREW
+    # ========================================================
 
     result = crew.kickoff()
+
+    # ========================================================
+    # GET RAW RESPONSE
+    # ========================================================
 
     raw_response = getattr(
         result,
@@ -400,13 +561,25 @@ Return ONLY valid JSON using this structure:
         str(result),
     )
 
+    if raw_response is None:
+
+        raw_response = ""
+
+    raw_response = str(
+        raw_response
+    ).strip()
+
+    # ========================================================
+    # PARSE JSON
+    # ========================================================
+
     parsed = extract_json(
         raw_response
     )
 
-    # --------------------------------------------------------
-    # Answer
-    # --------------------------------------------------------
+    # ========================================================
+    # ANSWER
+    # ========================================================
 
     answer = str(
         parsed.get(
@@ -416,14 +589,18 @@ Return ONLY valid JSON using this structure:
     ).strip()
 
     if not answer:
-        answer = raw_response.strip()
+
+        answer = raw_response
 
     if not answer:
-        answer = "The AI tutor did not return an answer."
 
-    # --------------------------------------------------------
-    # Not found
-    # --------------------------------------------------------
+        answer = (
+            "The AI tutor did not return an answer."
+        )
+
+    # ========================================================
+    # NOT FOUND
+    # ========================================================
 
     not_found = bool(
         parsed.get(
@@ -432,9 +609,9 @@ Return ONLY valid JSON using this structure:
         )
     )
 
-    # --------------------------------------------------------
-    # Citations
-    # --------------------------------------------------------
+    # ========================================================
+    # CITATIONS
+    # ========================================================
 
     citations = parsed.get(
         "citations",
@@ -445,10 +622,11 @@ Return ONLY valid JSON using this structure:
         citations,
         list,
     ):
+
         citations = []
 
-    # If the model didn't provide citations,
-    # generate them from retrieved evidence.
+    # If the AI tutor didn't return citations,
+    # generate them from the retrieved evidence.
 
     if not citations:
 
@@ -459,9 +637,9 @@ Return ONLY valid JSON using this structure:
             }
         )
 
-    # --------------------------------------------------------
-    # Agent 1 output
-    # --------------------------------------------------------
+    # ========================================================
+    # AGENT 1 SUMMARY
+    # ========================================================
 
     try:
 
@@ -471,17 +649,31 @@ Return ONLY valid JSON using this structure:
 
     except Exception:
 
-        retriever_summary = str(
-            retrieval_task.output
-        )
+        try:
 
-    # --------------------------------------------------------
-    # Return result to app.py
-    # --------------------------------------------------------
+            retriever_summary = str(
+                retrieval_task.output
+            )
+
+        except Exception:
+
+            retriever_summary = (
+                "The Document Retriever "
+                "completed without a readable "
+                "summary."
+            )
+
+    # ========================================================
+    # FINAL RESULT
+    # ========================================================
 
     return {
+
         "answer": answer,
+
         "not_found": not_found,
+
         "citations": citations,
+
         "retriever_summary": retriever_summary,
     }
