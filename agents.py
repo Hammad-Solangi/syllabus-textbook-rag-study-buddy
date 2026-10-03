@@ -452,9 +452,13 @@ Your job:
 
 4. Do not use outside knowledge.
 
-5. If the evidence is insufficient, clearly say so.
+5. Determine whether the evidence provides a direct,
+   partial, or no answer to the question.
 
-6. Do not invent or reconstruct information that is
+6. If the evidence is partial, identify exactly which
+   facts are supported and which information is missing.
+
+7. Do not invent or reconstruct information that is
    not supported by the supplied evidence.
 """,
 
