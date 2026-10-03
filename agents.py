@@ -5,48 +5,34 @@ import os
 import re
 from typing import Any
 
+import litellm
+
 from crewai import Agent, Crew, LLM, Process, Task
 from rag import SearchHit
 
-# ============================================================
-# GROQ + CREWAI / LITELLM COMPATIBILITY PATCH
-# ============================================================
-#
-# CrewAI may add "cache_breakpoint" to message dictionaries.
-# Groq rejects this property in its OpenAI-compatible API.
-#
-# We remove the property immediately before LiteLLM sends
-# the request to the provider.
-# ============================================================
 
-import litellm
-
+# ============================================================
+# GROQ / LITELLM COMPATIBILITY
+# ============================================================
 
 _original_litellm_completion = litellm.completion
 
 
 def _groq_safe_completion(*args, **kwargs):
     """
-    Remove CrewAI's unsupported cache_breakpoint field
-    before sending messages through LiteLLM.
+    Remove cache_breakpoint from messages before they are
+    sent to Groq.
     """
 
     messages = kwargs.get("messages")
 
     if isinstance(messages, list):
-
         cleaned_messages = []
 
         for message in messages:
-
             if isinstance(message, dict):
-
                 message = dict(message)
-
-                message.pop(
-                    "cache_breakpoint",
-                    None,
-                )
+                message.pop("cache_breakpoint", None)
 
             cleaned_messages.append(message)
 
@@ -65,19 +51,11 @@ litellm.completion = _groq_safe_completion
 # SECRET MANAGEMENT
 # ============================================================
 
-
 def get_secret(
     name: str,
     default: str = "",
 ) -> str:
-    """
-    Read a configuration value from:
-
-    1. Environment variables
-    2. Streamlit Secrets
-
-    Environment variables take priority.
-    """
+    """Read configuration from environment or Streamlit Secrets."""
 
     value = os.environ.get(name)
 
@@ -85,7 +63,6 @@ def get_secret(
         return value
 
     try:
-
         import streamlit as st
 
         value = st.secrets.get(name)
@@ -100,19 +77,11 @@ def get_secret(
 
 
 # ============================================================
-# LLM CREATION
+# LLM
 # ============================================================
 
-
 def create_llm() -> LLM:
-    """
-    Create the LLM configured in Streamlit Secrets.
-
-    Supported providers:
-
-    - Groq
-    - Gemini
-    """
+    """Create the configured language model."""
 
     provider = get_secret(
         "LLM_PROVIDER",
@@ -120,20 +89,18 @@ def create_llm() -> LLM:
     ).lower()
 
     # --------------------------------------------------------
-    # GEMINI
+    # Gemini
     # --------------------------------------------------------
 
     if provider == "gemini":
 
         api_key = get_secret(
-            "GEMINI_API_KEY"
+            "GEMINI_API_KEY",
         )
 
         if not api_key:
-
             raise RuntimeError(
-                "GEMINI_API_KEY is missing "
-                "from Streamlit Secrets."
+                "GEMINI_API_KEY is missing from Streamlit Secrets."
             )
 
         return LLM(
@@ -147,18 +114,16 @@ def create_llm() -> LLM:
         )
 
     # --------------------------------------------------------
-    # GROQ
+    # Groq
     # --------------------------------------------------------
 
     api_key = get_secret(
-        "GROQ_API_KEY"
+        "GROQ_API_KEY",
     )
 
     if not api_key:
-
         raise RuntimeError(
-            "GROQ_API_KEY is missing "
-            "from Streamlit Secrets."
+            "GROQ_API_KEY is missing from Streamlit Secrets."
         )
 
     return LLM(
@@ -174,17 +139,13 @@ def create_llm() -> LLM:
 
 
 # ============================================================
-# FORMAT RETRIEVED EVIDENCE
+# EVIDENCE FORMATTING
 # ============================================================
-
 
 def format_evidence(
     hits: list[SearchHit],
 ) -> str:
-    """
-    Convert retrieved document chunks into a structured
-    prompt for the CrewAI agents.
-    """
+    """Format retrieved document chunks for the agents."""
 
     sections = []
 
@@ -194,13 +155,8 @@ def format_evidence(
     ):
 
         if hit.page is not None:
-
-            location = (
-                f"Page {hit.page}"
-            )
-
+            location = f"Page {hit.page}"
         else:
-
             location = "Document text"
 
         sections.append(
@@ -218,34 +174,21 @@ Text:
 """.strip()
         )
 
-    return "\n\n".join(
-        sections
-    )
+    return "\n\n".join(sections)
 
 
 # ============================================================
-# JSON EXTRACTION
+# JSON PARSING
 # ============================================================
-
 
 def extract_json(
     text: str,
 ) -> dict[str, Any]:
-    """
-    Safely extract a JSON object from the AI tutor response.
-
-    Handles:
-
-    - Normal JSON
-    - ```json fenced JSON
-    - JSON embedded inside explanatory text
-    """
+    """Extract JSON safely from an LLM response."""
 
     text = text.strip()
 
-    # --------------------------------------------------------
-    # Remove Markdown code fences
-    # --------------------------------------------------------
+    # Remove Markdown JSON fences.
 
     if text.startswith("```"):
 
@@ -262,30 +205,19 @@ def extract_json(
             text,
         )
 
-    # --------------------------------------------------------
-    # Attempt 1: Entire response is JSON
-    # --------------------------------------------------------
+    # Try complete response as JSON.
 
     try:
 
-        result = json.loads(
-            text
-        )
+        result = json.loads(text)
 
-        if isinstance(
-            result,
-            dict,
-        ):
-
+        if isinstance(result, dict):
             return result
 
     except json.JSONDecodeError:
-
         pass
 
-    # --------------------------------------------------------
-    # Attempt 2: Find JSON object inside response
-    # --------------------------------------------------------
+    # Try finding JSON inside the response.
 
     match = re.search(
         r"\{.*\}",
@@ -301,24 +233,18 @@ def extract_json(
                 match.group(0)
             )
 
-            if isinstance(
-                result,
-                dict,
-            ):
-
+            if isinstance(result, dict):
                 return result
 
         except json.JSONDecodeError:
-
             pass
 
     return {}
 
 
 # ============================================================
-# MAIN CREWAI WORKFLOW
+# MAIN STUDY CREW
 # ============================================================
-
 
 def run_study_crew(
     question: str,
@@ -335,7 +261,7 @@ def run_study_crew(
     """
 
     # ========================================================
-    # NO RETRIEVED EVIDENCE
+    # NO EVIDENCE
     # ========================================================
 
     if not hits:
@@ -345,11 +271,8 @@ def run_study_crew(
                 "NOT FOUND IN DOCUMENT: "
                 "No relevant evidence was retrieved."
             ),
-
             "not_found": True,
-
             "citations": [],
-
             "retriever_summary": (
                 "The retrieval system did not find "
                 "relevant passages."
@@ -357,14 +280,10 @@ def run_study_crew(
         }
 
     # ========================================================
-    # CREATE LLM
+    # LLM
     # ========================================================
 
     llm = create_llm()
-
-    # ========================================================
-    # FORMAT DOCUMENT EVIDENCE
-    # ========================================================
 
     evidence = format_evidence(
         hits
@@ -375,19 +294,18 @@ def run_study_crew(
     # ========================================================
 
     document_retriever = Agent(
-
         role="Document Retriever",
 
         goal=(
-            "Analyze the supplied textbook evidence "
-            "and identify the passages and facts that "
-            "directly answer the student's question."
+            "Analyze the supplied textbook evidence and "
+            "identify the passages and facts that answer "
+            "the student's question."
         ),
 
         backstory=(
             "You are a careful academic research assistant. "
-            "You must work ONLY with the document evidence "
-            "provided to you. Never invent information."
+            "You work ONLY with the document evidence provided "
+            "to you. You never invent information."
         ),
 
         llm=llm,
@@ -402,20 +320,18 @@ def run_study_crew(
     # ========================================================
 
     ai_tutor = Agent(
-
         role="AI Tutor",
 
         goal=(
             "Explain the answer to the student clearly "
-            "using only the evidence provided by the "
-            "Document Retriever."
+            "using the evidence provided by the Document "
+            "Retriever."
         ),
 
         backstory=(
-            "You are a patient textbook tutor. "
-            "Your job is to turn verified textbook "
-            "evidence into an easy-to-understand "
-            "explanation."
+            "You are a patient textbook tutor. You turn "
+            "verified textbook evidence into clear, "
+            "student-friendly explanations."
         ),
 
         llm=llm,
@@ -426,11 +342,10 @@ def run_study_crew(
     )
 
     # ========================================================
-    # TASK 1 — RETRIEVE / VERIFY EVIDENCE
+    # TASK 1 — DOCUMENT ANALYSIS
     # ========================================================
 
     retrieval_task = Task(
-
         description=f"""
 Student question:
 
@@ -442,6 +357,8 @@ Retrieved textbook evidence:
 {evidence}
 
 
+Analyze the evidence carefully.
+
 Your job:
 
 1. Identify which passages are relevant.
@@ -452,38 +369,39 @@ Your job:
 
 4. Do not use outside knowledge.
 
-5. Determine whether the evidence provides a direct,
-   partial, or no answer to the question.
+5. Decide whether the evidence provides:
+   - a direct answer,
+   - a partial answer,
+   - or no meaningful answer.
 
-6. If the evidence is partial, identify exactly which
-   facts are supported and which information is missing.
+6. If the evidence is partial, clearly identify what
+   information IS supported by the document.
 
 7. Do not invent or reconstruct information that is
    not supported by the supplied evidence.
 """,
 
         expected_output=(
-            "A concise evidence summary containing only "
-            "facts supported by the supplied document "
-            "passages."
+            "A concise evidence analysis explaining whether "
+            "the retrieved material directly, partially, or "
+            "not at all answers the student's question."
         ),
 
         agent=document_retriever,
     )
 
     # ========================================================
-    # TASK 2 — TEACH THE STUDENT
+    # TASK 2 — AI TUTOR
     # ========================================================
 
-       tutor_task = Task(
-
+    tutor_task = Task(
         description=f"""
 Student question:
 
 {question}
 
 
-Use the Document Retriever's evidence summary to answer
+Use the Document Retriever's evidence analysis to answer
 the student's question.
 
 IMPORTANT RULES:
@@ -491,39 +409,35 @@ IMPORTANT RULES:
 1. Use the retrieved document evidence as the primary
    source of truth.
 
-2. Do NOT invent facts that contradict the document.
+2. Do not invent facts.
 
-3. If the document directly answers the question,
+3. Do not contradict the document.
+
+4. If the document directly answers the question,
    provide a clear student-friendly answer.
 
-4. If the document provides PARTIAL information about
-   the question, answer using ONLY the supported
-   information and clearly state what the document does
-   and does not explain.
+5. If the document provides PARTIAL information,
+   answer using the information that IS supported.
 
-5. If the document mentions the requested concept but
+6. If the document mentions the requested concept but
    does not provide a complete definition, do NOT mark
-   it as NOT FOUND. Instead, explain the information that
-   IS present in the document.
+   it as NOT FOUND. Explain what the document actually
+   says and clearly mention what is missing.
 
-6. Only set "not_found" to true when the retrieved
+7. Only set "not_found" to true when the retrieved
    evidence contains no meaningful information relevant
    to the question.
 
-7. For mathematics, show the relevant solution steps when
-   those steps are supported by the supplied material.
+8. For mathematics, show relevant solution steps when
+   those steps are supported by the document.
 
-8. Include source/page references when available.
+9. Include source/page references whenever available.
 
-9. Do not pretend that information exists in the document
-   when it does not.
-
-Student-friendly explanations are encouraged, but any
-information presented as coming from the textbook must be
-supported by the retrieved evidence.
+10. Do not claim that something is written in the
+    textbook if it is not supported by the evidence.
 
 
-Return ONLY valid JSON using exactly this structure:
+Return ONLY valid JSON in this exact structure:
 
 {{
     "answer": "Your student-friendly answer",
@@ -535,22 +449,22 @@ Return ONLY valid JSON using exactly this structure:
 """,
 
         expected_output=(
-            "Valid JSON containing answer, "
-            "not_found, and citations."
+            "Valid JSON containing answer, not_found, "
+            "and citations."
         ),
 
         agent=ai_tutor,
 
         context=[
-            retrieval_task
+            retrieval_task,
         ],
     )
+
     # ========================================================
-    # CREATE CREW
+    # CREW
     # ========================================================
 
     crew = Crew(
-
         agents=[
             document_retriever,
             ai_tutor,
@@ -567,14 +481,10 @@ Return ONLY valid JSON using exactly this structure:
     )
 
     # ========================================================
-    # RUN CREW
+    # EXECUTE
     # ========================================================
 
     result = crew.kickoff()
-
-    # ========================================================
-    # GET RAW RESPONSE
-    # ========================================================
 
     raw_response = getattr(
         result,
@@ -583,7 +493,6 @@ Return ONLY valid JSON using exactly this structure:
     )
 
     if raw_response is None:
-
         raw_response = ""
 
     raw_response = str(
@@ -591,16 +500,12 @@ Return ONLY valid JSON using exactly this structure:
     ).strip()
 
     # ========================================================
-    # PARSE JSON
+    # PARSE ANSWER
     # ========================================================
 
     parsed = extract_json(
         raw_response
     )
-
-    # ========================================================
-    # ANSWER
-    # ========================================================
 
     answer = str(
         parsed.get(
@@ -610,11 +515,9 @@ Return ONLY valid JSON using exactly this structure:
     ).strip()
 
     if not answer:
-
         answer = raw_response
 
     if not answer:
-
         answer = (
             "The AI tutor did not return an answer."
         )
@@ -643,11 +546,7 @@ Return ONLY valid JSON using exactly this structure:
         citations,
         list,
     ):
-
         citations = []
-
-    # If the AI tutor didn't return citations,
-    # generate them from the retrieved evidence.
 
     if not citations:
 
@@ -679,22 +578,17 @@ Return ONLY valid JSON using exactly this structure:
         except Exception:
 
             retriever_summary = (
-                "The Document Retriever "
-                "completed without a readable "
-                "summary."
+                "The Document Retriever completed "
+                "without a readable summary."
             )
 
     # ========================================================
-    # FINAL RESULT
+    # RETURN RESULT
     # ========================================================
 
     return {
-
         "answer": answer,
-
         "not_found": not_found,
-
         "citations": citations,
-
         "retriever_summary": retriever_summary,
     }
